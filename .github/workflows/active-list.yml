@@ -1,0 +1,52 @@
+name: Lista de satélites activos
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'   # 4 intentos al día; con que salga uno basta
+  workflow_dispatch:          # También se puede lanzar a mano desde GitHub
+
+jobs:
+  active-list:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write         # Necesario para publicar la lista en el repo
+
+    steps:
+      - name: Descargar de CelesTrak y publicar la lista de activos
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Una sola petición, sin reintentos: CelesTrak pide no insistir.
+          HTTP_STATUS=$(curl -s -o /tmp/gp.json -w "%{http_code}" --max-time 60 \
+            -H "User-Agent: SatFleetLive-ActiveList/1.0 (https://satfleetlive.com; contact: jaime.automatiza@gmail.com)" \
+            "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=json" || echo "000")
+          echo "HTTP Status: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::warning::CelesTrak devolvió HTTP $HTTP_STATUS. Se mantiene la lista anterior."
+            exit 0
+          fi
+
+          # Del archivo grande solo se guardan los números de satélite (~100 KB).
+          mkdir -p /tmp/pub
+          python3 - <<'PY' || { echo "::warning::La respuesta no es una lista válida. Se mantiene la lista anterior."; exit 0; }
+          import json, datetime
+          d = json.load(open('/tmp/gp.json'))
+          assert isinstance(d, list) and len(d) >= 5000
+          ids = sorted({int(o['NORAD_CAT_ID']) for o in d})
+          out = {'updated': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                 'source': 'celestrak.org', 'count': len(ids), 'ids': ids}
+          json.dump(out, open('/tmp/pub/active-ids.json', 'w'), separators=(',', ':'))
+          print('Lista OK:', len(ids), 'satélites')
+          PY
+
+          # Se publica en la rama "data" SOBRESCRIBIENDO siempre el mismo commit:
+          # así el repositorio nunca crece (el viejo llegó a 1 GB por guardar
+          # 6,7 MB en cada ejecución).
+          cd /tmp/pub
+          git init -q -b data
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add active-ids.json
+          git commit -q -m "Lista de activos $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push -q --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" data
+          echo "Lista publicada"
